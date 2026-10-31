@@ -62,13 +62,22 @@ class FeatureState:
             "round_amount": float(amount % 100 == 0),
         }
 
-    def update(self, row):
+    def update(self, row, trusted=True, attempt=True):
+        """Remember a payment.
+
+        trusted: add it to what we consider this sender's normal behaviour
+                 (usual amount, known devices, known recipients).
+        attempt: count it toward the sender's recent activity (velocity).
+        A payment held for review is an attempt but not yet trusted.
+        """
         sender = row["sender_id"]
-        self.count[sender] += 1
-        self.amount_sum[sender] += int(row["amount_paise"]) / 100
-        self.recipients[sender].add(row["recipient_id"])
-        self.devices[sender].add(row["device_id"])
-        self.recent[sender].append(datetime.fromisoformat(row["timestamp"]).timestamp())
+        if trusted:
+            self.count[sender] += 1
+            self.amount_sum[sender] += int(row["amount_paise"]) / 100
+            self.recipients[sender].add(row["recipient_id"])
+            self.devices[sender].add(row["device_id"])
+        if attempt:
+            self.recent[sender].append(datetime.fromisoformat(row["timestamp"]).timestamp())
 
 
 def _log(x):

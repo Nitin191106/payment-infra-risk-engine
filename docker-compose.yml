@@ -9,7 +9,8 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+      # Runs 001_init.sql, 002_idempotency.sql, 003_risk.sql in order on a fresh database
+      - ./db:/docker-entrypoint-initdb.d
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U payments"]
       interval: 5s
@@ -20,6 +21,10 @@ services:
     build: .
     environment:
       DATABASE_URL: postgresql+psycopg2://payments:payments@db:5432/payments
+      RISK_MODEL_PATH: models/risk_model.joblib
+      # DEVELOPMENT ONLY: lets the simulator set the clock via X-Simulated-Time.
+      # Remove this line in production.
+      RISK_SIMULATION_MODE: "1"
     ports:
       - "8000:8000"
     depends_on:
@@ -27,6 +32,8 @@ services:
         condition: service_healthy
     volumes:
       - ./app:/code/app
+      - ./risk:/code/risk
+      - ./models:/code/models:ro
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 volumes:

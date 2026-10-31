@@ -3,3 +3,9 @@ __pycache__/
 .venv/
 .env
 .pytest_cache/
+
+data/
+models/
+
+data/
+models/

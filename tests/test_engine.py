@@ -108,3 +108,21 @@ def test_hybrid_engine_catches_most_fraud_and_rarely_blocks_normal_payments():
     assert sum(d.decision != "approve" for d in fraud) / len(fraud) > 0.8
     assert sum(d.decision == "block" for d in normal) / len(normal) < 0.01
     assert sum(d.decision == "approve" for d in normal) / len(normal) > 0.95
+
+
+def test_held_payment_counts_toward_velocity_but_is_not_trusted():
+    engine = warmed_up_engine()
+    engine.record_attempt(tx("12:00:00", device="dev_new"))
+    f = engine.state.compute(tx("12:00:10", device="dev_new"))
+    assert f["count_1min"] == 1.0      # the held payment counts as recent activity
+    assert f["new_device"] == 1.0      # but the device is still not trusted
+
+
+def test_approved_held_payment_becomes_trusted_without_double_counting():
+    engine = warmed_up_engine()
+    held = tx("12:00:00", device="dev_new")
+    engine.record_attempt(held)
+    engine.trust(held)
+    f = engine.state.compute(tx("12:00:10", device="dev_new"))
+    assert f["new_device"] == 0.0      # now a known device
+    assert f["count_1min"] == 1.0      # still one attempt, not two

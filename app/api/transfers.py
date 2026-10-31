@@ -1,16 +1,17 @@
-"""Day 3: transfers with idempotency keys.
+"""Day 7: every transfer is judged by the risk engine BEFORE any money moves.
 
-Idempotency idea: the client sends an `Idempotency-Key` header. If the same key
-arrives again (retry, double click, network glitch) we return the ORIGINAL
-response instead of moving money a second time.
+  approve -> posted to the ledger as before            (HTTP 201)
+  review  -> held, no money moves until a human acts   (HTTP 202, see /reviews)
+  block   -> refused, no money moves                   (HTTP 403, with reasons)
 
-How it stays safe: the key row, the ledger entries and the saved response are
-all written in ONE database transaction. A duplicate request that arrives while
-the first is still running blocks on the key's unique index until the first one
-commits, then replays its result. No "in progress" state is needed.
+Every decision is written to risk_assessments. Idempotency still applies: the
+key row, the ledger entries, the audit row and the saved response are written in
+ONE database transaction, so a retried request gets the same answer (including a
+block or a hold) and never moves money twice.
 """
 import hashlib
 import json
+from datetime import datetime, timezone
 from typing import Annotated
 from uuid import UUID
 
@@ -22,6 +23,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
+from app.risk_service import get_engine, simulation_mode
 
 router = APIRouter(tags=["transfers"])
 
@@ -31,6 +33,8 @@ class TransferCreate(BaseModel):
     to_account_id: UUID
     amount: int = Field(gt=0, description="Amount in paise (5000 = Rs 50.00)")
     description: str | None = None
+    device_id: str | None = Field(default=None, max_length=100,
+                                  description="Device the payment was made from")
 
 
 class DepositCreate(BaseModel):
@@ -50,6 +54,20 @@ def get_balance(db: Session, account_id: UUID) -> int:
     return int(value)
 
 
+def _check_accounts(db: Session, from_id: UUID, to_id: UUID) -> None:
+    """Cheap checks before the risk engine looks at the payment."""
+    if from_id == to_id:
+        raise HTTPException(422, "from_account_id and to_account_id must differ")
+    currencies = {}
+    for acc_id in (from_id, to_id):
+        row = db.execute(text("SELECT currency FROM accounts WHERE id = :id"), {"id": acc_id}).first()
+        if row is None:
+            raise HTTPException(404, f"account {acc_id} not found")
+        currencies[acc_id] = row[0]
+    if currencies[from_id] != currencies[to_id]:
+        raise HTTPException(422, "currency mismatch between accounts")
+
+
 def _post_transfer_uncommitted(
     db: Session,
     from_id: UUID,
@@ -57,8 +75,15 @@ def _post_transfer_uncommitted(
     amount: int,
     description: str | None,
     allow_overdraft: bool = False,
+    existing_txn_id: UUID | None = None,
+    risk_score: float | None = None,
+    risk_decision: str | None = None,
 ) -> UUID:
-    """Lock, check funds and insert the debit + credit. Does NOT commit."""
+    """Lock, check funds and insert the debit + credit. Does NOT commit.
+
+    With existing_txn_id, the payment was held for review: that transaction is
+    moved from 'review' to 'posted' instead of creating a new one.
+    """
     if from_id == to_id:
         raise HTTPException(422, "from_account_id and to_account_id must differ")
 
@@ -82,13 +107,22 @@ def _post_transfer_uncommitted(
         if balance < amount:
             raise HTTPException(409, f"insufficient funds: balance {balance}, requested {amount}")
 
-    txn_id = db.execute(
-        text(
-            "INSERT INTO transactions (status, description) "
-            "VALUES ('posted', :d) RETURNING id"
-        ),
-        {"d": description},
-    ).scalar_one()
+    if existing_txn_id is not None:
+        moved = db.execute(
+            text("UPDATE transactions SET status = 'posted' WHERE id = :t AND status = 'review'"),
+            {"t": existing_txn_id},
+        )
+        if moved.rowcount != 1:
+            raise HTTPException(409, "transaction is not waiting for review")
+        txn_id = existing_txn_id
+    else:
+        txn_id = db.execute(
+            text(
+                "INSERT INTO transactions (status, description, risk_score, risk_decision) "
+                "VALUES ('posted', :d, :s, :r) RETURNING id"
+            ),
+            {"d": description, "s": risk_score, "r": risk_decision},
+        ).scalar_one()
 
     for acc_id, direction in ((from_id, "debit"), (to_id, "credit")):
         db.execute(
@@ -118,7 +152,7 @@ def post_transfer(
     description: str | None,
     allow_overdraft: bool = False,
 ) -> UUID:
-    """Move money atomically and commit. Returns the transaction id."""
+    """Move money atomically and commit, with no risk check (used by deposits and tests)."""
     txn_id = _post_transfer_uncommitted(db, from_id, to_id, amount, description, allow_overdraft)
     _commit_or_500(db)
     return txn_id
@@ -129,12 +163,41 @@ def _hash_request(body: BaseModel) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
+def _event_time(header_value: str | None) -> datetime:
+    """The time the risk engine uses. Only in simulation mode can a client set it."""
+    if simulation_mode() and header_value:
+        try:
+            when = datetime.fromisoformat(header_value)
+        except ValueError:
+            raise HTTPException(422, "X-Simulated-Time must be an ISO timestamp")
+        return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc)
+
+
+def _log_assessment(db: Session, body: TransferCreate, device: str, decision, txn_id) -> None:
+    db.execute(
+        text(
+            "INSERT INTO risk_assessments (transaction_id, sender_id, recipient_id, amount, "
+            "device_id, decision, risk_score, model_percentile, rules, reasons) "
+            "VALUES (:t, :s, :r, :a, :dev, :d, :score, :pct, "
+            "CAST(:rules AS jsonb), CAST(:reasons AS jsonb))"
+        ),
+        {
+            "t": txn_id, "s": body.from_account_id, "r": body.to_account_id,
+            "a": body.amount, "dev": device, "d": decision.decision,
+            "score": decision.risk_score, "pct": decision.model_percentile,
+            "rules": json.dumps(decision.rules), "reasons": json.dumps(decision.reasons),
+        },
+    )
+
+
 @router.post("/transfers", status_code=201)
 def create_transfer(
     body: TransferCreate,
     idempotency_key: Annotated[
         str, Header(alias="Idempotency-Key", min_length=8, max_length=255)
     ],
+    x_simulated_time: Annotated[str | None, Header(alias="X-Simulated-Time")] = None,
     db: Session = Depends(get_db),
 ):
     request_hash = _hash_request(body)
@@ -169,24 +232,60 @@ def create_transfer(
             headers={"Idempotent-Replay": "true"},
         )
 
-    # 3. First time we see this key: do the transfer and save the response,
-    #    all inside one transaction.
+    # 3. First time we see this key: judge the payment, then act on the decision.
+    device = body.device_id or "unknown"
     try:
-        txn_id = _post_transfer_uncommitted(
-            db, body.from_account_id, body.to_account_id, body.amount, body.description
-        )
-        response = {
-            "transaction_id": str(txn_id),
-            "status": "posted",
-            "from_balance": get_balance(db, body.from_account_id),
-            "to_balance": get_balance(db, body.to_account_id),
+        _check_accounts(db, body.from_account_id, body.to_account_id)
+
+        event = {
+            "timestamp": _event_time(x_simulated_time).isoformat(),
+            "sender_id": str(body.from_account_id),
+            "recipient_id": str(body.to_account_id),
+            "amount_paise": body.amount,
+            "device_id": device,
         }
+        engine = get_engine()
+        decision = engine.assess(event)
+        verdict = {
+            "decision": decision.decision,
+            "risk_score": decision.risk_score,
+            "reasons": decision.reasons,
+        }
+
+        if decision.decision == "block":
+            status_code, txn_id = 403, None
+            response = {"status": "blocked", **verdict}
+        elif decision.decision == "review":
+            status_code = 202
+            txn_id = db.execute(
+                text(
+                    "INSERT INTO transactions (status, description, risk_score, risk_decision) "
+                    "VALUES ('review', :d, :s, 'review') RETURNING id"
+                ),
+                {"d": body.description, "s": decision.risk_score},
+            ).scalar_one()
+            response = {"status": "pending_review", "transaction_id": str(txn_id), **verdict}
+        else:
+            status_code = 201
+            txn_id = _post_transfer_uncommitted(
+                db, body.from_account_id, body.to_account_id, body.amount, body.description,
+                risk_score=decision.risk_score, risk_decision="approve",
+            )
+            response = {
+                "transaction_id": str(txn_id),
+                "status": "posted",
+                "from_balance": get_balance(db, body.from_account_id),
+                "to_balance": get_balance(db, body.to_account_id),
+                **verdict,
+            }
+
+        _log_assessment(db, body, device, decision, txn_id)
         db.execute(
             text(
-                "UPDATE idempotency_keys SET response_status = 201, "
+                "UPDATE idempotency_keys SET response_status = :s, "
                 "response_body = CAST(:b AS jsonb) WHERE key = :k"
             ),
-            {"b": json.dumps(response), "k": idempotency_key},
+            {"s": status_code, "b": json.dumps(response), "k": idempotency_key},
         )
     except HTTPException:
         # Failed requests are NOT remembered: rolling back also removes the key,
@@ -195,7 +294,13 @@ def create_transfer(
         raise
 
     _commit_or_500(db)
-    return JSONResponse(status_code=201, content=response)
+
+    # Only after a successful commit does the engine learn from the payment.
+    if decision.decision == "approve":
+        engine.record(event, decision)
+    elif decision.decision == "review":
+        engine.record_attempt(event)
+    return JSONResponse(status_code=status_code, content=response)
 
 
 def get_or_create_treasury(db: Session, currency: str) -> UUID:

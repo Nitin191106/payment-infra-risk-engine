@@ -17,6 +17,7 @@ are confident: any block rule blocks; otherwise the model's percentile decides.
 Blocked payments are NOT remembered as normal behaviour, so a fraudster can't
 "teach" the engine that a new device or recipient is fine.
 """
+import threading
 from dataclasses import asdict, dataclass, field
 
 import numpy as np
@@ -92,6 +93,7 @@ class RiskEngine:
     def __init__(self, bundle=None, config=None):
         self.config = config or RiskConfig()
         self.state = FeatureState()
+        self._lock = threading.Lock()  # the API serves requests on several threads
         self.model = bundle["model"] if bundle else None
         self.quantiles = bundle["score_quantiles"] if bundle else None
 
@@ -109,8 +111,9 @@ class RiskEngine:
 
     def assess(self, row):
         cfg = self.config
-        f = self.state.compute(row)
-        pct = self._model_percentile(f)
+        with self._lock:
+            f = self.state.compute(row)
+        pct = self._model_percentile(f)  # slow part, done outside the lock
         fired = evaluate_rules(f, cfg)
 
         if any(a == "block" for a, _, _ in fired) or pct >= cfg.block_percentile:
@@ -155,4 +158,16 @@ class RiskEngine:
     def record(self, row, decision):
         """Remember a payment. Blocked ones are not trusted as normal behaviour."""
         if decision.decision != "block":
-            self.state.update(row)
+            with self._lock:
+                self.state.update(row)
+
+    def record_attempt(self, row):
+        """A payment held for review: it counts toward velocity but is not yet trusted."""
+        with self._lock:
+            self.state.update(row, trusted=False)
+
+    def trust(self, row):
+        """A held payment was approved by a human: now it is normal behaviour.
+        Its attempt was already counted, so it is not counted twice."""
+        with self._lock:
+            self.state.update(row, trusted=True, attempt=False)
