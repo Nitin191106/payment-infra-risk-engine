@@ -80,7 +80,8 @@ def test_model_ranks_fraud_above_normal_traffic():
     from risk.train import train
 
     rows = generate(users=300, days=30, seed=42)
-    _, threshold, scores, y, _ = train(rows)
+    bundle, scores, y, _ = train(rows)
+    threshold = bundle["threshold"]
     assert roc_auc_score(y, scores) > 0.9
     flagged = scores >= threshold
     assert flagged[y == 1].mean() > 0.6          # catches most fraud

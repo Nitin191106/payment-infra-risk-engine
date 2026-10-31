@@ -1,11 +1,13 @@
-"""Day 5: train an Isolation Forest on the simulated transactions and measure it.
+"""Train an Isolation Forest on the simulated transactions and measure it.
 
-    pip install scikit-learn
     python -m risk.train
 
 Isolation Forest is UNSUPERVISED: it never sees the fraud labels while learning.
 It learns what normal traffic looks like and scores how odd each payment is.
 The labels are used only afterwards, to grade it.
+
+Day 6 change: the saved model also carries `score_quantiles`, so the risk engine
+can say "this payment is more unusual than 99.2% of past traffic".
 """
 import argparse
 import csv
@@ -34,7 +36,10 @@ def metrics(y_true, flagged):
 
 
 def train(rows, train_share=0.7, flag_rate=0.03, seed=42):
-    """Fit on the earlier part of the timeline, test on the later part."""
+    """Fit on the earlier part of the timeline, test on the later part.
+
+    Returns (bundle, test_scores, y_test, kinds_test). The bundle is what gets saved.
+    """
     X = np.array(build_features(rows))
     y = np.array([int(r["is_fraud"]) for r in rows])
     kinds = np.array([r["fraud_type"] for r in rows])
@@ -46,12 +51,18 @@ def train(rows, train_share=0.7, flag_rate=0.03, seed=42):
     # Higher score = more anomalous. The alert threshold is set on TRAINING data
     # so that about `flag_rate` of normal-looking traffic would be flagged.
     train_scores = -model.score_samples(X[:cut])
-    threshold = float(np.quantile(train_scores, 1 - flag_rate))
+    bundle = {
+        "model": model,
+        "threshold": float(np.quantile(train_scores, 1 - flag_rate)),
+        "score_quantiles": np.quantile(train_scores, np.linspace(0, 1, 1001)),
+        "features": FEATURE_NAMES,
+    }
     test_scores = -model.score_samples(X[cut:])
-    return model, threshold, test_scores, y[cut:], kinds[cut:]
+    return bundle, test_scores, y[cut:], kinds[cut:]
 
 
-def report(model, threshold, scores, y, kinds):
+def report(bundle, scores, y, kinds):
+    threshold = bundle["threshold"]
     print(f"Test set: {len(y):,} transactions, {int(y.sum())} fraud ({y.mean():.2%})")
     print(f"ROC AUC: {roc_auc_score(y, scores):.3f}   (1.0 = perfect ranking, 0.5 = random)\n")
 
@@ -82,11 +93,11 @@ def main():
     args = ap.parse_args()
 
     rows = load_rows(args.csv)
-    model, threshold, scores, y, kinds = train(rows, flag_rate=args.flag_rate)
-    report(model, threshold, scores, y, kinds)
+    bundle, scores, y, kinds = train(rows, flag_rate=args.flag_rate)
+    report(bundle, scores, y, kinds)
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump({"model": model, "threshold": threshold, "features": FEATURE_NAMES}, args.out)
+    joblib.dump(bundle, args.out)
     print(f"\nSaved model to {args.out}")
 
 
